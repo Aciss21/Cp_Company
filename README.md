@@ -1,8 +1,8 @@
 <div align="center">
 
-# Hi there, I'm K-one 👋
+# Hi there, I'm Teh 👋
 
-### 💻 Developer | 🚀 Tech Enthusiast
+### 💻 Developer
 
 [![GitHub followers](https://img.shields.io/github/followers/Kenshin1444?style=social)](https://github.com/Kenshin1444)
 [![Profile Views](https://komarev.com/ghpvc/?username=Kenshin1444&color=blue)](https://github.com/Kenshin1444)
