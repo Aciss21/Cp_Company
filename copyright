@@ -1,0 +1,431 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+# ==========================================
+# Kernel Build Configuration
+# ==========================================
+
+KERNEL_DIR="$(cd "$(dirname "$0")" && pwd)"
+OUT="$KERNEL_DIR/out"
+
+KNAME="Shirayuki"
+VAR="-Oem"
+USR="Aciss.?"
+DEVICE="courbet"
+ZIPNAME="${KNAME}-${VAR}.zip"
+
+DEFCONFIG="vendor/acis_defconfig"
+THREADS="$(nproc --all)"
+
+BUILD_LOG="$KERNEL_DIR/build.log"
+BUILD_START_EPOCH=0
+BUILD_START_TIME=""
+
+# ==========================================
+# Neutron Clang
+# ==========================================
+
+CLANG_ROOT="$KERNEL_DIR/clang"
+CLANG_BIN="$CLANG_ROOT/bin"
+
+CLANG_URL="https://github.com/Neutron-Toolchains/clang-build-catalogue/releases/download/09092023/neutron-clang-09092023.tar.zst"
+CLANG_ARCHIVE="$KERNEL_DIR/neutron-clang.tar.zst"
+
+# ==========================================
+# GreenForce GCC
+# ==========================================
+
+GCC64_ROOT="$KERNEL_DIR/gcc64-greenforce"
+GCC32_ROOT="$KERNEL_DIR/gcc32-greenforce"
+
+GCC64_REPO="https://github.com/greenforce-project/gcc-arm64.git"
+GCC32_REPO="https://github.com/greenforce-project/gcc-arm.git"
+
+# ==========================================
+# AnyKernel3
+# ==========================================
+
+ANYKERNEL_DIR="$KERNEL_DIR/AnyKernel3"
+ANYKERNEL_REPO="https://github.com/Aciss21/AnyKernel3.git"
+
+# ==========================================
+# Telegram Configuration
+# ==========================================
+
+TG_ENV="$KERNEL_DIR/usr/.tg.env"
+
+# ==========================================
+# Load Telegram Environment
+# ==========================================
+
+if [[ -f "$TG_ENV" ]]; then
+    source "$TG_ENV"
+else
+    
+fi
+
+TG_TOKEN="${TG_TOKEN:-}"
+TG_CHAT_ID="${TG_CHAT_ID:-}"
+
+# ==========================================
+# Telegram Functions
+# ==========================================
+
+send_telegram() {
+    local message="$1"
+
+    if [[ -z "$TG_TOKEN" || -z "$TG_CHAT_ID" ]]; then
+        return 0
+    fi
+
+    curl -fsS --max-time 20 \
+        -X POST \
+        "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+        --data-urlencode "chat_id=${TG_CHAT_ID}" \
+        --data-urlencode "text=${message}" \
+        --data-urlencode "parse_mode=HTML" \
+        >/dev/null || true
+}
+
+upload_telegram() {
+    local file="$1"
+
+    if [[ -z "$TG_TOKEN" || -z "$TG_CHAT_ID" ]]; then
+        echo "Telegram upload skipped: credentials unavailable."
+        return 0
+    fi
+
+    curl -fsS --max-time 300 \
+        -X POST \
+        "https://api.telegram.org/bot${TG_TOKEN}/sendDocument" \
+        -F "chat_id=${TG_CHAT_ID}" \
+        -F "document=@${file}" \
+        -F "caption=Aciss Kernel | ${DEVICE}" \
+        >/dev/null
+}
+
+# ==========================================
+# Utility Functions
+# ==========================================
+
+format_duration() {
+    local seconds="$1"
+    printf '%02dh %02dm %02ds' \
+        "$((seconds / 3600))" \
+        "$(((seconds % 3600) / 60))" \
+        "$((seconds % 60))"
+}
+
+cleanup() {
+    rm -f "$CLANG_ARCHIVE"
+}
+
+on_error() {
+    local exit_code=$?
+    local now duration log_tail
+
+    trap - ERR
+    set +e
+
+    now="$(date '+%Y-%m-%d %H:%M:%S %Z')"
+    duration="N/A"
+
+    if (( BUILD_START_EPOCH > 0 )); then
+        duration="$(format_duration "$(( $(date +%s) - BUILD_START_EPOCH ))")"
+    fi
+
+    log_tail=""
+
+    if [[ -f "$BUILD_LOG" ]]; then
+        log_tail="$(tail -n 12 "$BUILD_LOG" 2>/dev/null)"
+    fi
+
+    send_telegram \
+"<pre>✗ BUILD FAILED
+
+Device: ${DEVICE}
+Builder: ${USR}
+Defconfig: ${DEFCONFIG}
+Exit code: ${exit_code}
+Duration: ${duration}
+Time: ${now}
+
+Log: build.log</pre>"
+
+    if [[ -n "$log_tail" ]]; then
+        send_telegram "<pre>Last build output:
+${log_tail}</pre>"
+    fi
+
+    exit "$exit_code"
+}
+
+trap cleanup EXIT
+trap on_error ERR
+
+# ==========================================
+# Clean Option
+# Usage: ./build.sh --clean
+# ==========================================
+
+if [[ "${1:-}" == "-c" || "${1:-}" == "--clean" ]]; then
+    echo "Cleaning previous build..."
+    rm -rf "$OUT"
+    rm -f "$BUILD_LOG"
+    shift
+fi
+
+# ==========================================
+# Check Dependencies
+# ==========================================
+
+for cmd in git wget curl tar zstd make zip; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        echo "Missing dependency: $cmd"
+        exit 1
+    fi
+done
+
+# ==========================================
+# Setup Neutron Clang
+# ==========================================
+
+echo "Checking Neutron Clang..."
+
+if [[ ! -x "$CLANG_BIN/clang" ]]; then
+    echo "Downloading Neutron Clang..."
+
+    mkdir -p "$CLANG_ROOT"
+
+    wget -q --show-progress \
+        "$CLANG_URL" \
+        -O "$CLANG_ARCHIVE"
+
+    tar --use-compress-program=zstd \
+        -xf "$CLANG_ARCHIVE" \
+        -C "$CLANG_ROOT"
+fi
+
+if [[ ! -x "$CLANG_BIN/clang" ]]; then
+    echo "Error: clang not found at $CLANG_BIN/clang"
+    echo "Check the extracted archive layout."
+    exit 1
+fi
+
+# ==========================================
+# Setup GreenForce GCC ARM64
+# ==========================================
+
+echo "Checking GreenForce GCC ARM64..."
+
+if [[ ! -d "$GCC64_ROOT/.git" ]]; then
+    git clone --depth=1 \
+        "$GCC64_REPO" \
+        "$GCC64_ROOT"
+fi
+
+# ==========================================
+# Setup GreenForce GCC ARM32
+# ==========================================
+
+echo "Checking GreenForce GCC ARM32..."
+
+if [[ ! -d "$GCC32_ROOT/.git" ]]; then
+    git clone --depth=1 \
+        "$GCC32_REPO" \
+        "$GCC32_ROOT"
+fi
+
+# ==========================================
+# Configure Toolchain PATH
+# ==========================================
+
+export PATH="$CLANG_BIN:$GCC64_ROOT/bin:$GCC32_ROOT/bin:$PATH"
+
+export ARCH=arm64
+export SUBARCH=arm64
+export KBUILD_BUILD_USER=Aciss?
+export KBUILD_BUILD_HOST=CpCompany
+
+echo
+echo "========== Toolchains =========="
+"$CLANG_BIN/clang" --version | head -n 1
+echo "ARM64 GCC directory: $GCC64_ROOT"
+echo "ARM32 GCC directory: $GCC32_ROOT"
+echo "================================="
+
+# ==========================================
+# Build Start
+# ==========================================
+
+cd "$KERNEL_DIR"
+
+BUILD_START_EPOCH="$(date +%s)"
+BUILD_START_TIME="$(date '+%Y-%m-%d %H:%M:%S %Z')"
+
+mkdir -p "$OUT"
+rm -f "$BUILD_LOG"
+
+echo "Starting kernel build..."
+
+send_telegram \
+"<pre>⚙ BUILD STARTED
+
+Device: ${DEVICE}
+Builder: ${USR}
+Compiler: Neutron Clang
+GCC: GreenForce ARM64 + ARM32
+Defconfig: ${DEFCONFIG}
+Jobs: ${THREADS}
+Started: ${BUILD_START_TIME}</pre>"
+
+# ==========================================
+# Step 1: Generate Defconfig
+# ==========================================
+
+echo "Generating defconfig..."
+
+make O="$OUT" \
+    ARCH=arm64 \
+    LLVM=1 \
+    LLVM_IAS=1 \
+    CROSS_COMPILE=aarch64-linux-gnu- \
+    CROSS_COMPILE=aarch64-linux-gnu- \
+    "$DEFCONFIG"
+
+# ==========================================
+# Step 2: Compile Kernel
+# ==========================================
+
+echo "Compiling kernel..."
+
+set +e
+
+make -j"$THREADS" \
+    O="$OUT" \
+    ARCH=arm64 \
+    LLVM=1 \
+    LLVM_IAS=1 \
+    CROSS_COMPILE=aarch64-linux-gnu- \
+    CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+    2>&1 | tee "$BUILD_LOG"
+
+BUILD_STATUS="${PIPESTATUS[0]}"
+
+set -e
+
+if [[ "$BUILD_STATUS" -ne 0 ]]; then
+    echo "Kernel compilation failed."
+    exit "$BUILD_STATUS"
+fi
+
+# ==========================================
+# Step 3: Locate Kernel Image
+# ==========================================
+
+IMAGE=""
+
+for candidate in \
+    "$OUT/arch/arm64/boot/Image.gz-dtb" \
+    "$OUT/arch/arm64/boot/Image.gz" \
+    "$OUT/arch/arm64/boot/Image"; do
+
+    if [[ -f "$candidate" ]]; then
+        IMAGE="$candidate"
+        break
+    fi
+done
+
+if [[ -z "$IMAGE" ]]; then
+    echo "Error: kernel image not found."
+    exit 1
+fi
+
+# ==========================================
+# Step 4: Prepare AnyKernel3
+# ==========================================
+
+echo "Preparing AnyKernel3..."
+
+if [[ ! -d "$ANYKERNEL_DIR/.git" ]]; then
+    git clone --depth=1 \
+        "$ANYKERNEL_REPO" \
+        "$ANYKERNEL_DIR"
+fi
+
+cd "$ANYKERNEL_DIR"
+
+rm -f Image Image.gz Image.gz-dtb dtb
+
+case "$(basename "$IMAGE")" in
+    Image.gz-dtb)
+        cp "$IMAGE" Image.gz-dtb
+        ;;
+    Image.gz)
+        cp "$IMAGE" Image.gz
+        ;;
+    Image)
+        cp "$IMAGE" Image
+        ;;
+esac
+
+if [[ -f "$OUT/arch/arm64/boot/dtb" ]]; then
+    cp "$OUT/arch/arm64/boot/dtb" dtb
+fi
+
+# ==========================================
+# Step 5: Package ZIP
+# ==========================================
+
+echo "Packaging kernel ZIP..."
+
+rm -f "$KERNEL_DIR/$ZIPNAME"
+
+zip -r9 "$KERNEL_DIR/$ZIPNAME" . \
+    -x '.git/*' \
+    -x '.gitignore' \
+    -x 'README.md'
+
+if [[ ! -s "$KERNEL_DIR/$ZIPNAME" ]]; then
+    echo "Error: ZIP packaging failed."
+    exit 1
+fi
+
+ZIP_SIZE="$(du -h "$KERNEL_DIR/$ZIPNAME" | awk '{print $1}')"
+BUILD_END_EPOCH="$(date +%s)"
+BUILD_END_TIME="$(date '+%Y-%m-%d %H:%M:%S %Z')"
+BUILD_DURATION="$(format_duration "$((BUILD_END_EPOCH - BUILD_START_EPOCH))")"
+
+# ==========================================
+# Step 6: Upload ZIP to Telegram
+# ==========================================
+
+echo "Uploading ZIP to Telegram..."
+
+upload_telegram "$KERNEL_DIR/$ZIPNAME"
+
+# ==========================================
+# Step 7: Build Success
+# ==========================================
+
+send_telegram \
+"<pre>✓ BUILD SUCCESSFUL
+
+Device: ${DEVICE}
+Kernel: ${ZIPNAME}
+Size: ${ZIP_SIZE}
+Duration: ${BUILD_DURATION}
+Finished: ${BUILD_END_TIME}
+
+Compiler: Neutron Clang
+GCC: GreenForce ARM64 + ARM32</pre>"
+
+echo
+echo "=========================================="
+echo "Build completed successfully."
+echo "Device:  $DEVICE"
+echo "Output:  $KERNEL_DIR/$ZIPNAME"
+echo "Size:    $ZIP_SIZE"
+echo "Duration: $BUILD_DURATION"
+echo "=========================================="
